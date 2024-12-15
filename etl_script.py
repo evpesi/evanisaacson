@@ -1,74 +1,100 @@
 import requests
 import csv
 import time
+import io
+import boto3
+from botocore.exceptions import NoCredentialsError
 
-api_url = 'https://data.cms.gov/provider-data/api/1/datastore/query/632h-zaca/0'
-headers = {
+# AWS S3 configuration
+S3_BUCKET = 'evan-data-project' 
+S3_KEY = 'CMS_data/CMS_Unplanned_Hospital_Visits.csv'  # Path and filename in S3
+
+# Initialize an S3 client (relies on preset credentials from environment)
+s3_client = boto3.client('s3')
+
+# Set up our connection to the healthcare database
+database_url = 'https://data.cms.gov/provider-data/api/1/datastore/query/632h-zaca/0'
+how_to_talk = {
     'accept': 'application/json',
     'Content-Type': 'application/json',
 }
 
-limit = 2000
-offset = 0  # Start at the first record
-all_records = []  # Store all unique records
-unique_record_ids = set()  # Track unique records
+# Prepare for data collection
+records_per_request = 2000
+starting_point = 0
+all_unique_records = []
+seen_records = set()
 
+# Start collecting data
 while True:
-    # Prepare the API request payload with offset
-    data = {
-        "limit": limit,
-        "offset": offset,
-        "sort": [{"property": "record_number", "direction": "asc"}]  # Ensure consistent order
+    # Ask for a batch of data
+    request_details = {
+        "limit": records_per_request,
+        "offset": starting_point,
+        "sort": [{"property": "record_number", "direction": "asc"}]
     }
 
-    response = requests.post(api_url, headers=headers, json=data)
-    response_json = response.json()
+    # Send request and get response
+    response = requests.post(database_url, headers=how_to_talk, json=request_details)
+    data_received = response.json()
 
-    # Check for 'results' key
-    if "results" not in response_json:
-        print("No 'results' key found in response. Exiting.")
+    # Check if we got what we asked for
+    if "results" not in data_received:
+        print("Oops! The database didn't give us the results we expected. Let's stop here.")
         break
 
-    records = response_json.get("results", [])
-    if not records:
-        print("No more data found.")
+    batch_of_records = data_received.get("results", [])
+    if not batch_of_records:
+        print("Looks like we've collected all the data there is!")
         break
 
-    # Filter and append only unique records
+    # Find new, unique records
     new_records = []
-    for record in records:
-        record_id = record.get('facility_id') + record.get('measure_id', '')  # Unique ID logic
-        if record_id not in unique_record_ids:
-            unique_record_ids.add(record_id)
+    for record in batch_of_records:
+        # Create a unique fingerprint to ensure there are no duplicates
+        record_fingerprint = record.get('facility_id', '') + record.get('measure_id', '')
+        if record_fingerprint not in seen_records:
+            seen_records.add(record_fingerprint)
             new_records.append(record)
 
-    all_records.extend(new_records)
+    all_unique_records.extend(new_records)
 
-    # Debugging Output
-    print(f"Fetched {len(records)} records, {len(new_records)} new. Total unique so far: {len(all_records)}")
+    # Give an update on our progress
+    print(f"We just fetched {len(batch_of_records)} records, {len(new_records)} were new. "
+          f"We now have {len(all_unique_records)} unique records in total.")
 
-    # Increment the offset for the next batch
-    offset += len(records)
+    # Prepare for the next batch
+    starting_point += len(batch_of_records)
 
-    # Stop the loop if no new records were added
+    # Stop if we didn't find any new records
     if len(new_records) == 0:
-        print("No new records found in this batch. Exiting loop.")
+        print("We didn't find any new records in this batch. Done!")
         break
 
-    # Optional: Add delay to prevent rate-limiting
+    # Take a short breather to be nice to the database
     time.sleep(0.5)
 
-# Write the collected data to a CSV file
-csv_file = "cms_data.csv"
-if all_records:
-    # Extract field names from the first record
-    fieldnames = all_records[0].keys()
+# If we have data, upload it directly to S3 in CSV format
+if all_unique_records:
+    # Determine columns from the first record
+    column_names = all_unique_records[0].keys()
 
-    with open(csv_file, mode="w", newline="", encoding="utf-8") as file:
-        writer = csv.DictWriter(file, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(all_records)
+    # Write CSV data to an in-memory buffer
+    csv_buffer = io.StringIO()
+    writer = csv.DictWriter(csv_buffer, fieldnames=column_names)
+    writer.writeheader()
+    writer.writerows(all_unique_records)
 
-    print(f"Data successfully saved to {csv_file}")
+    try:
+        # Upload the CSV content from memory to S3
+        s3_client.put_object(
+            Bucket=S3_BUCKET,
+            Key=S3_KEY,
+            Body=csv_buffer.getvalue(),
+            ContentType='text/csv'
+        )
+        print(f"Great news! All the data has been uploaded to s3://{S3_BUCKET}/{S3_KEY}")
+    except NoCredentialsError:
+        print("Error: AWS credentials not found. Please configure.")
 else:
-    print("No data to save.")
+    print("We didn't find any data to save. Better luck next time!")
